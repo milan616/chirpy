@@ -174,6 +174,58 @@ func (cfg *apiConfig) handlerCreateUser(w http.ResponseWriter, r *http.Request) 
 	})
 }
 
+func (cfg *apiConfig) handlerGetChirps(w http.ResponseWriter, r *http.Request) {
+	ctx := context.Background()
+
+	dbChirps, err := cfg.db.GetAllChirps(ctx)
+	if err != nil {
+		respondWithError(w, http.StatusBadRequest, "Could not retrieve chirps")
+	}
+
+	apiChirps := make([]Chirp, len(dbChirps))
+
+	for i, dbChirp := range dbChirps {
+		apiChirps[i] = Chirp{
+			ID:        dbChirp.ID,
+			CreatedAt: dbChirp.CreatedAt.Time,
+			UpdatedAt: dbChirp.UpdatedAt.Time,
+			Body:      dbChirp.Body,
+			UserID:    dbChirp.UserID,
+		}
+	}
+
+	respondWithJSON(w, http.StatusOK, apiChirps)
+}
+
+func (cfg *apiConfig) handlerGetChirpByID(w http.ResponseWriter, r *http.Request) {
+	chirpIDString := r.PathValue("chirpID")
+
+	chirpUUID, err := uuid.Parse(chirpIDString)
+	if err != nil {
+		respondWithError(w, http.StatusBadRequest, "Invalid chirp ID format")
+		return
+	}
+
+	ctx := context.Background()
+	dbChirp, err := cfg.db.GetChirp(ctx, chirpUUID)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			respondWithError(w, http.StatusNotFound, "Chirp not found")
+			return
+		}
+		respondWithError(w, http.StatusInternalServerError, "Could not retrieve chirp")
+		return
+	}
+
+	respondWithJSON(w, http.StatusOK, Chirp{
+		ID:        dbChirp.ID,
+		CreatedAt: dbChirp.CreatedAt.Time,
+		UpdatedAt: dbChirp.UpdatedAt.Time,
+		Body:      dbChirp.Body,
+		UserID:    dbChirp.UserID,
+	})
+}
+
 func naughtyCleaner(chirp string) string {
 	// Let's use a slice instead of an array so it works directly with slices.Contains
 	naughty := []string{"kerfuffle", "sharbert", "fornax"}
@@ -245,6 +297,8 @@ func main() {
 
 	mux.HandleFunc("POST /api/users", apiCfg.handlerCreateUser)
 	mux.HandleFunc("POST /api/chirps", apiCfg.handlerCreateChirp)
+	mux.HandleFunc("GET /api/chirps", apiCfg.handlerGetChirps)
+	mux.HandleFunc("GET /api/chirps/{chirpID}", apiCfg.handlerGetChirpByID)
 
 	// Register methods attached to our apiCfg instance
 	mux.HandleFunc("GET /admin/metrics", apiCfg.handlerMetrics)
