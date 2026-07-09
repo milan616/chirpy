@@ -27,14 +27,9 @@ type apiConfig struct {
 	platform		string
 }
 
-// 1. Define the incoming request body structure
 type chirpRequest struct {
 	Body string `json:"body"`
-}
-
-// 2. Define the successful validation response structure
-type chirpResponse struct {
-	CleanedBody string `json:"cleaned_body"`
+	UserID string `json:"user_id"`
 }
 
 type User struct {
@@ -42,6 +37,14 @@ type User struct {
 	CreatedAt	time.Time `json:"created_at"`
 	UpdatedAt	time.Time `json:"updated_at"`
 	Email		string    `json:"email"`
+}
+
+type Chirp struct {
+	ID			uuid.UUID	`json:"id"`
+	CreatedAt	time.Time	`json:"created_at"`
+	UpdatedAt	time.Time	`json:"updated_at"`
+	Body		string 		`json:"body"`
+	UserID		uuid.UUID	`json:"user_id"`
 }
 
 // 2. Middleware to increment fileserverHits counter
@@ -82,7 +85,7 @@ func (cfg *apiConfig) handlerReset(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (cfg *apiConfig) handlerValidateChirp(w http.ResponseWriter, r *http.Request) {
+func (cfg *apiConfig) handlerCreateChirp(w http.ResponseWriter, r *http.Request) {
 	decoder := json.NewDecoder(r.Body)
 	var req chirpRequest
 	err := decoder.Decode(&req)
@@ -91,17 +94,42 @@ func (cfg *apiConfig) handlerValidateChirp(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	// Silly rule validation: maximum 140 characters
 	if len(req.Body) > 140 {
 		respondWithError(w, http.StatusBadRequest, "Chirp is too long")
 		return
 	}
 
 	cleaned := naughtyCleaner(req.Body)
+	var userUUID uuid.UUID
+	userUUID, err = uuid.Parse(req.UserID)
+	if err != nil {
+		respondWithError(w, http.StatusBadRequest, "Invalid user_id")
+	}
 
-	// If valid, respond with status 200 OK
-	respondWithJSON(w, http.StatusOK, chirpResponse{
-		CleanedBody: cleaned,
+	chirpParams := database.CreateChirpParams {
+		ID: uuid.New(),
+		CreatedAt: sql.NullTime{Time: time.Now(), Valid: true},
+		UpdatedAt: sql.NullTime{Time: time.Now(), Valid: true},
+		Body:      cleaned,
+		UserID:    userUUID,
+	}
+
+	ctx := context.Background()
+	var newChirp database.Chirp
+
+	newChirp, err = cfg.db.CreateChirp(ctx, chirpParams)
+	if err != nil {
+		log.Printf("Database error creating chirp: %v", err)
+		respondWithError(w, http.StatusBadRequest, "Could not create new chirp")
+		return
+	}
+
+	respondWithJSON(w, http.StatusCreated, Chirp{
+		ID:			newChirp.ID,
+		CreatedAt:	newChirp.CreatedAt.Time,
+		UpdatedAt:	newChirp.UpdatedAt.Time,
+		Body:		newChirp.Body,
+		UserID:		newChirp.UserID,
 	})
 }
 
@@ -134,7 +162,6 @@ func (cfg *apiConfig) handlerCreateUser(w http.ResponseWriter, r *http.Request) 
 	var newUser database.User
 	newUser, err = cfg.db.CreateUser(ctx, newUserParams)
 	if err != nil {
-		log.Printf("Database error creating user: %v", err)
 		respondWithError(w, http.StatusBadRequest, "Could not create new user")
 		return
 	}
@@ -217,12 +244,11 @@ func main() {
 	})
 
 	mux.HandleFunc("POST /api/users", apiCfg.handlerCreateUser)
+	mux.HandleFunc("POST /api/chirps", apiCfg.handlerCreateChirp)
 
 	// Register methods attached to our apiCfg instance
 	mux.HandleFunc("GET /admin/metrics", apiCfg.handlerMetrics)
 	mux.HandleFunc("POST /admin/reset", apiCfg.handlerReset)
-
-	mux.HandleFunc("POST /api/validate_chirp", apiCfg.handlerValidateChirp)
 
 	server := &http.Server{
 		Addr:    ":8080",
