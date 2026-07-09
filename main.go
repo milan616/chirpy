@@ -8,11 +8,23 @@ import (
 	"encoding/json"
 	"strings"
 	"slices"
+	"database/sql"
+	"os"
+	"time"
+	"context"
+
+	"github.com/milan616/chirpy/internal/database"
+
+	_ "github.com/lib/pq"
+	"github.com/google/uuid"
+	"github.com/joho/godotenv"
 )
 
 // 1. Create the apiConfig struct to hold stateful metrics safely
 type apiConfig struct {
-	fileserverHits atomic.Int32
+	fileserverHits	atomic.Int32
+	db 				*database.Queries
+	platform		string
 }
 
 // 1. Define the incoming request body structure
@@ -23,6 +35,13 @@ type chirpRequest struct {
 // 2. Define the successful validation response structure
 type chirpResponse struct {
 	CleanedBody string `json:"cleaned_body"`
+}
+
+type User struct {
+	ID			uuid.UUID `json:"id"`
+	CreatedAt	time.Time `json:"created_at"`
+	UpdatedAt	time.Time `json:"updated_at"`
+	Email		string    `json:"email"`
 }
 
 // 2. Middleware to increment fileserverHits counter
@@ -52,10 +71,15 @@ func (cfg *apiConfig) handlerMetrics(w http.ResponseWriter, r *http.Request) {
 // 4. Handler to reset metrics at /reset
 func (cfg *apiConfig) handlerReset(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-	// Use Store() to safely reset the value to 0
-	cfg.fileserverHits.Store(0)
-	w.Write([]byte("Hits reset to 0"))
+	if cfg.platform != "DEV" {
+		w.WriteHeader(http.StatusForbidden)
+	} else {
+		w.WriteHeader(http.StatusOK)
+		ctx := context.Background()
+		cfg.db.ResetUsers(ctx)
+		cfg.fileserverHits.Store(0)
+		w.Write([]byte("Hits reset to 0"))
+	}
 }
 
 func (cfg *apiConfig) handlerValidateChirp(w http.ResponseWriter, r *http.Request) {
@@ -78,6 +102,48 @@ func (cfg *apiConfig) handlerValidateChirp(w http.ResponseWriter, r *http.Reques
 	// If valid, respond with status 200 OK
 	respondWithJSON(w, http.StatusOK, chirpResponse{
 		CleanedBody: cleaned,
+	})
+}
+
+func (cfg *apiConfig) handlerCreateUser(w http.ResponseWriter, r *http.Request) {
+	type NewUser struct {
+		Email	string	`json:"email"`
+	}
+	
+	decoder := json.NewDecoder(r.Body)
+	var email NewUser
+	err := decoder.Decode(&email)
+	if err != nil {
+		respondWithError(w, http.StatusBadRequest, "Something went wrong")
+		return
+	}
+
+	if email.Email == "" {
+		respondWithError(w, http.StatusBadRequest, "Missing email field")
+		return
+	}
+
+	newUserParams := database.CreateUserParams {
+		ID: uuid.New(),
+		CreatedAt: sql.NullTime{Time: time.Now(), Valid: true},
+		UpdatedAt: sql.NullTime{Time: time.Now(), Valid: true},
+		Email:      email.Email,
+	}
+
+	ctx := context.Background()
+	var newUser database.User
+	newUser, err = cfg.db.CreateUser(ctx, newUserParams)
+	if err != nil {
+		log.Printf("Database error creating user: %v", err)
+		respondWithError(w, http.StatusBadRequest, "Could not create new user")
+		return
+	}
+	
+	respondWithJSON(w, http.StatusCreated, User{
+		ID:        newUser.ID,
+		Email:     newUser.Email,
+		CreatedAt: newUser.CreatedAt.Time, // Unpacks the real time from sql.NullTime
+		UpdatedAt: newUser.UpdatedAt.Time, // Unpacks the real time from sql.NullTime
 	})
 }
 
@@ -126,10 +192,17 @@ func respondWithError(w http.ResponseWriter, code int, msg string) {
 }
 
 func main() {
+	godotenv.Load()
+	dbURL := os.Getenv("DB_URL")
+	db, err := sql.Open("postgres", dbURL)
+	dbQueries := database.New(db)
+	
 	mux := http.NewServeMux()
 
 	// Initialize our state tracking instance
 	apiCfg := &apiConfig{}
+	apiCfg.db = dbQueries
+	apiCfg.platform = os.Getenv("PLATFORM")
 
 	// Wrap the basic fileserver with our new tracking middleware
 	fileServerHandler := http.FileServer(http.Dir("."))
@@ -143,6 +216,8 @@ func main() {
 		w.Write([]byte("OK"))
 	})
 
+	mux.HandleFunc("POST /api/users", apiCfg.handlerCreateUser)
+
 	// Register methods attached to our apiCfg instance
 	mux.HandleFunc("GET /admin/metrics", apiCfg.handlerMetrics)
 	mux.HandleFunc("POST /admin/reset", apiCfg.handlerReset)
@@ -155,7 +230,7 @@ func main() {
 	}
 
 	log.Println("Starting server on port 8080...")
-	err := server.ListenAndServe()
+	err = server.ListenAndServe()
 	if err != nil {
 		log.Fatal(err)
 	}
