@@ -217,36 +217,103 @@ func (cfg *apiConfig) handlerLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Default expiration handling
-	defaultExpiry := 1 * time.Hour
-	if loginUser.ExpiresInSeconds > 0 {
-		userExpiry := time.Duration(loginUser.ExpiresInSeconds) * time.Second
-		// Cap it to 1 hour maximum
-		if userExpiry < defaultExpiry {
-			defaultExpiry = userExpiry
-		}
-	}
+	tokenExpiry := 1 * time.Hour
 
-	token, err := auth.MakeJWT(matchUser.ID, cfg.jwtSecret, defaultExpiry)
+	token, err := auth.MakeJWT(matchUser.ID, cfg.jwtSecret, tokenExpiry)
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Could not generate authentication token")
 		return
 	}
 
-	// Custom inline shape matching assignment requirements
+	refreshToken := auth.MakeRefreshToken()
+	refreshDuration := 60 * 24 * time.Hour
+	refreshExpiryTimestamp := time.Now().Add(refreshDuration)
+
+	params := database.CreateRefreshTokenParams{
+		Token:		refreshToken,
+		CreatedAt:	sql.NullTime{Time: time.Now(), Valid: true},
+		UpdatedAt:	sql.NullTime{Time: time.Now(), Valid: true},
+		UserID:		matchUser.ID,
+		ExpiresAt:	sql.NullTime{Time: refreshExpiryTimestamp, Valid: true},
+		RevokedAt:	sql.NullTime{Time: time.Time{}, Valid: false},
+	}
+
+	_, err = cfg.db.CreateRefreshToken(ctx, params)
+
 	respondWithJSON(w, http.StatusOK, struct {
 		ID        uuid.UUID `json:"id"`
 		CreatedAt time.Time `json:"created_at"`
 		UpdatedAt time.Time `json:"updated_at"`
 		Email     string    `json:"email"`
 		Token     string    `json:"token"`
+		RefreshToken	string	`json:"refresh_token"`
 	}{
 		ID:        matchUser.ID,
 		Email:     matchUser.Email,
 		CreatedAt: matchUser.CreatedAt.Time,
 		UpdatedAt: matchUser.UpdatedAt.Time,
 		Token:     token,
+		RefreshToken: refreshToken,
 	})
+}
+
+func (cfg *apiConfig) handlerRefresh(w http.ResponseWriter, r *http.Request) {
+	tokenStr, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		respondWithError(w, http.StatusUnauthorized, "Missing or invalid token format")
+		return
+	}
+
+	ctx := context.Background()
+	dbToken, err := cfg.db.GetRefreshToken(ctx, tokenStr)
+	if err != nil {
+		respondWithError(w, http.StatusUnauthorized, "Unauthorized")
+		return
+	}
+
+	if dbToken.ExpiresAt.Time.Before(time.Now()) || dbToken.RevokedAt.Valid {
+		respondWithError(w, http.StatusUnauthorized, "Token expired or revoked")
+		return
+	}
+
+	user, err := cfg.db.GetUserFromRefreshToken(ctx, tokenStr)
+	if err != nil {
+		respondWithError(w, http.StatusUnauthorized, "Unauthorized")
+		return
+	}
+
+	newAccessToken, err := auth.MakeJWT(user.ID, cfg.jwtSecret, 1*time.Hour)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Could not generate access token")
+		return
+	}
+
+	respondWithJSON(w, http.StatusOK, struct {
+		Token string `json:"token"`
+	}{
+		Token: newAccessToken,
+	})
+}
+
+func (cfg *apiConfig) handlerRevoke(w http.ResponseWriter, r *http.Request) {
+	tokenStr, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		respondWithError(w, http.StatusUnauthorized, "Missing or invalid token format")
+		return
+	}
+
+	ctx := context.Background()
+	err = cfg.db.RevokeRefreshToken(ctx, database.RevokeRefreshTokenParams{
+		Token:     tokenStr,
+		RevokedAt: sql.NullTime{Time: time.Now(), Valid: true},
+		UpdatedAt: sql.NullTime{Time: time.Now(), Valid: true},
+	})
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Could not revoke token")
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (cfg *apiConfig) handlerGetChirps(w http.ResponseWriter, r *http.Request) {
@@ -302,27 +369,21 @@ func (cfg *apiConfig) handlerGetChirpByID(w http.ResponseWriter, r *http.Request
 }
 
 func naughtyCleaner(chirp string) string {
-	// Let's use a slice instead of an array so it works directly with slices.Contains
 	naughty := []string{"kerfuffle", "sharbert", "fornax"}
 
-	// Split the original chirp so we can modify individual words while keeping casing
 	words := strings.Split(chirp, " ")
 
 	for i, word := range words {
-		// Clean up the word for a pure lowercase comparison check
 		cleanedWord := strings.ToLower(word)
 		
-		// The Python equivalent of: if cleanedWord in naughty:
 		if slices.Contains(naughty, cleanedWord) {
 			words[i] = "****"
 		}
 	}
 
-	// Rejoin the slice back into a full string space-separated
 	return strings.Join(words, " ")
 }
 
-// Helper to respond with clean JSON payloads
 func respondWithJSON(w http.ResponseWriter, code int, payload interface{}) {
 	dat, err := json.Marshal(payload)
 	if err != nil {
@@ -335,7 +396,6 @@ func respondWithJSON(w http.ResponseWriter, code int, payload interface{}) {
 	w.Write(dat)
 }
 
-// Helper to standardise error responses using the JSON helper
 func respondWithError(w http.ResponseWriter, code int, msg string) {
 	type errorResponse struct {
 		Error string `json:"error"`
@@ -373,6 +433,9 @@ func main() {
 
 	mux.HandleFunc("POST /api/users", apiCfg.handlerCreateUser)
 	mux.HandleFunc("POST /api/login", apiCfg.handlerLogin)
+	mux.HandleFunc("POST /api/refresh", apiCfg.handlerRefresh)
+	mux.HandleFunc("POST /api/revoke", apiCfg.handlerRevoke)
+	
 	mux.HandleFunc("POST /api/chirps", apiCfg.handlerCreateChirp)
 	mux.HandleFunc("GET /api/chirps", apiCfg.handlerGetChirps)
 	mux.HandleFunc("GET /api/chirps/{chirpID}", apiCfg.handlerGetChirpByID)
