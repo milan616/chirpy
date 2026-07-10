@@ -14,10 +14,12 @@ import (
 	"context"
 
 	"github.com/milan616/chirpy/internal/database"
+	"github.com/milan616/chirpy/internal/auth"
 
 	_ "github.com/lib/pq"
 	"github.com/google/uuid"
 	"github.com/joho/godotenv"
+	"github.com/golang-jwt/jwt/v5"
 )
 
 // 1. Create the apiConfig struct to hold stateful metrics safely
@@ -37,6 +39,11 @@ type User struct {
 	CreatedAt	time.Time `json:"created_at"`
 	UpdatedAt	time.Time `json:"updated_at"`
 	Email		string    `json:"email"`
+}
+
+type LoginUser struct {
+	Password	string	`json:"password"`
+	Email		string	`json:"email"`
 }
 
 type Chirp struct {
@@ -134,28 +141,32 @@ func (cfg *apiConfig) handlerCreateChirp(w http.ResponseWriter, r *http.Request)
 }
 
 func (cfg *apiConfig) handlerCreateUser(w http.ResponseWriter, r *http.Request) {
-	type NewUser struct {
-		Email	string	`json:"email"`
-	}
 	
 	decoder := json.NewDecoder(r.Body)
-	var email NewUser
-	err := decoder.Decode(&email)
+	var user LoginUser
+	err := decoder.Decode(&user)
 	if err != nil {
 		respondWithError(w, http.StatusBadRequest, "Something went wrong")
 		return
 	}
 
-	if email.Email == "" {
-		respondWithError(w, http.StatusBadRequest, "Missing email field")
+	if user.Email == "" || user.Password == "" {
+		respondWithError(w, http.StatusBadRequest, "Missing required email/password")
 		return
+	}
+
+	var hashedPass string
+	hashedPass, err = auth.HashPassword(user.Password)
+	if err != nil {
+		respondWithError(w, http.StatusBadRequest, "Unable to validate password")
 	}
 
 	newUserParams := database.CreateUserParams {
 		ID: uuid.New(),
 		CreatedAt: sql.NullTime{Time: time.Now(), Valid: true},
 		UpdatedAt: sql.NullTime{Time: time.Now(), Valid: true},
-		Email:      email.Email,
+		Email:      user.Email,
+		HashedPassword:	hashedPass,
 	}
 
 	ctx := context.Background()
@@ -171,6 +182,42 @@ func (cfg *apiConfig) handlerCreateUser(w http.ResponseWriter, r *http.Request) 
 		Email:     newUser.Email,
 		CreatedAt: newUser.CreatedAt.Time, // Unpacks the real time from sql.NullTime
 		UpdatedAt: newUser.UpdatedAt.Time, // Unpacks the real time from sql.NullTime
+	})
+}
+
+func (cfg *apiConfig) handlerLogin(w http.ResponseWriter, r *http.Request) {
+
+	decoder := json.NewDecoder(r.Body)
+	var loginUser LoginUser
+	err := decoder.Decode(&loginUser)
+	if err != nil {
+		respondWithError(w, http.StatusBadRequest, "Something went wrong")
+		return
+	}
+
+	if loginUser.Email == "" || loginUser.Password == "" {
+		respondWithError(w, http.StatusBadRequest, "Missing required email/password")
+		return
+	}
+
+	ctx := context.Background()
+	var matchUser database.User
+
+	matchUser, err = cfg.db.GetUserByEmail(ctx, loginUser.Email)
+	if err != nil {
+		respondWithError(w, http.StatusBadRequest, "User not found")
+	}
+
+	match := false
+	if match, err = auth.CheckPasswordHash(loginUser.Password, matchUser.HashedPassword); match == false {
+		respondWithError(w, http.StatusUnauthorized, "Invalid password")
+	}
+
+	respondWithJSON(w, http.StatusOK, User{
+		ID:        matchUser.ID,
+		Email:     matchUser.Email,
+		CreatedAt: matchUser.CreatedAt.Time, // Unpacks the real time from sql.NullTime
+		UpdatedAt: matchUser.UpdatedAt.Time, // Unpacks the real time from sql.NullTime
 	})
 }
 
@@ -296,6 +343,7 @@ func main() {
 	})
 
 	mux.HandleFunc("POST /api/users", apiCfg.handlerCreateUser)
+	mux.HandleFunc("POST /api/login", apiCfg.handlerLogin)
 	mux.HandleFunc("POST /api/chirps", apiCfg.handlerCreateChirp)
 	mux.HandleFunc("GET /api/chirps", apiCfg.handlerGetChirps)
 	mux.HandleFunc("GET /api/chirps/{chirpID}", apiCfg.handlerGetChirpByID)
