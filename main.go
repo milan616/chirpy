@@ -19,7 +19,6 @@ import (
 	_ "github.com/lib/pq"
 	"github.com/google/uuid"
 	"github.com/joho/godotenv"
-	"github.com/golang-jwt/jwt/v5"
 )
 
 // 1. Create the apiConfig struct to hold stateful metrics safely
@@ -27,6 +26,7 @@ type apiConfig struct {
 	fileserverHits	atomic.Int32
 	db 				*database.Queries
 	platform		string
+	jwtSecret		string
 }
 
 type chirpRequest struct {
@@ -42,8 +42,9 @@ type User struct {
 }
 
 type LoginUser struct {
-	Password	string	`json:"password"`
-	Email		string	`json:"email"`
+	Password			string	`json:"password"`
+	Email				string	`json:"email"`
+	ExpiresInSeconds	int		`json:"expires_in_seconds"`
 }
 
 type Chirp struct {
@@ -54,15 +55,13 @@ type Chirp struct {
 	UserID		uuid.UUID	`json:"user_id"`
 }
 
-// 2. Middleware to increment fileserverHits counter
 func (cfg *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		cfg.fileserverHits.Add(1) // Safely add 1 to the counter
-		next.ServeHTTP(w, r)       // Pass control to the next handler
+		cfg.fileserverHits.Add(1)
+		next.ServeHTTP(w, r)
 	})
 }
 
-// 3. Handler to view metrics at /metrics
 func (cfg *apiConfig) handlerMetrics(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
@@ -74,11 +73,9 @@ func (cfg *apiConfig) handlerMetrics(w http.ResponseWriter, r *http.Request) {
   </body>
 </html>`
 	
-	// Use Load() to safely read the atomic value
 	w.Write([]byte(fmt.Sprintf(adminText, cfg.fileserverHits.Load())))
 }
 
-// 4. Handler to reset metrics at /reset
 func (cfg *apiConfig) handlerReset(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	if cfg.platform != "DEV" {
@@ -93,9 +90,23 @@ func (cfg *apiConfig) handlerReset(w http.ResponseWriter, r *http.Request) {
 }
 
 func (cfg *apiConfig) handlerCreateChirp(w http.ResponseWriter, r *http.Request) {
+	// 1. Authenticate Request via Bearer JWT first
+	token, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		respondWithError(w, http.StatusUnauthorized, "Unauthorized")
+		return
+	}
+
+	userID, err := auth.ValidateJWT(token, cfg.jwtSecret)
+	if err != nil {
+		respondWithError(w, http.StatusUnauthorized, "Unauthorized")
+		return
+	}
+
+	// 2. Unpack Chirp parameters
 	decoder := json.NewDecoder(r.Body)
 	var req chirpRequest
-	err := decoder.Decode(&req)
+	err = decoder.Decode(&req)
 	if err != nil {
 		respondWithError(w, http.StatusBadRequest, "Something went wrong")
 		return
@@ -107,24 +118,17 @@ func (cfg *apiConfig) handlerCreateChirp(w http.ResponseWriter, r *http.Request)
 	}
 
 	cleaned := naughtyCleaner(req.Body)
-	var userUUID uuid.UUID
-	userUUID, err = uuid.Parse(req.UserID)
-	if err != nil {
-		respondWithError(w, http.StatusBadRequest, "Invalid user_id")
-	}
 
-	chirpParams := database.CreateChirpParams {
-		ID: uuid.New(),
+	chirpParams := database.CreateChirpParams{
+		ID:        uuid.New(),
 		CreatedAt: sql.NullTime{Time: time.Now(), Valid: true},
 		UpdatedAt: sql.NullTime{Time: time.Now(), Valid: true},
 		Body:      cleaned,
-		UserID:    userUUID,
+		UserID:    userID, // Controlled by JWT
 	}
 
 	ctx := context.Background()
-	var newChirp database.Chirp
-
-	newChirp, err = cfg.db.CreateChirp(ctx, chirpParams)
+	newChirp, err := cfg.db.CreateChirp(ctx, chirpParams)
 	if err != nil {
 		log.Printf("Database error creating chirp: %v", err)
 		respondWithError(w, http.StatusBadRequest, "Could not create new chirp")
@@ -132,11 +136,11 @@ func (cfg *apiConfig) handlerCreateChirp(w http.ResponseWriter, r *http.Request)
 	}
 
 	respondWithJSON(w, http.StatusCreated, Chirp{
-		ID:			newChirp.ID,
-		CreatedAt:	newChirp.CreatedAt.Time,
-		UpdatedAt:	newChirp.UpdatedAt.Time,
-		Body:		newChirp.Body,
-		UserID:		newChirp.UserID,
+		ID:        newChirp.ID,
+		CreatedAt: newChirp.CreatedAt.Time,
+		UpdatedAt: newChirp.UpdatedAt.Time,
+		Body:      newChirp.Body,
+		UserID:    newChirp.UserID,
 	})
 }
 
@@ -180,13 +184,12 @@ func (cfg *apiConfig) handlerCreateUser(w http.ResponseWriter, r *http.Request) 
 	respondWithJSON(w, http.StatusCreated, User{
 		ID:        newUser.ID,
 		Email:     newUser.Email,
-		CreatedAt: newUser.CreatedAt.Time, // Unpacks the real time from sql.NullTime
-		UpdatedAt: newUser.UpdatedAt.Time, // Unpacks the real time from sql.NullTime
+		CreatedAt: newUser.CreatedAt.Time,
+		UpdatedAt: newUser.UpdatedAt.Time,
 	})
 }
 
 func (cfg *apiConfig) handlerLogin(w http.ResponseWriter, r *http.Request) {
-
 	decoder := json.NewDecoder(r.Body)
 	var loginUser LoginUser
 	err := decoder.Decode(&loginUser)
@@ -201,23 +204,48 @@ func (cfg *apiConfig) handlerLogin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := context.Background()
-	var matchUser database.User
-
-	matchUser, err = cfg.db.GetUserByEmail(ctx, loginUser.Email)
+	matchUser, err := cfg.db.GetUserByEmail(ctx, loginUser.Email)
 	if err != nil {
-		respondWithError(w, http.StatusBadRequest, "User not found")
+		respondWithError(w, http.StatusUnauthorized, "Incorrect email or password")
+		return
 	}
 
 	match := false
-	if match, err = auth.CheckPasswordHash(loginUser.Password, matchUser.HashedPassword); match == false {
-		respondWithError(w, http.StatusUnauthorized, "Invalid password")
+	match, err = auth.CheckPasswordHash(loginUser.Password, matchUser.HashedPassword)
+	if err != nil || !match {
+		respondWithError(w, http.StatusUnauthorized, "Incorrect email or password")
+		return
 	}
 
-	respondWithJSON(w, http.StatusOK, User{
+	// Default expiration handling
+	defaultExpiry := 1 * time.Hour
+	if loginUser.ExpiresInSeconds > 0 {
+		userExpiry := time.Duration(loginUser.ExpiresInSeconds) * time.Second
+		// Cap it to 1 hour maximum
+		if userExpiry < defaultExpiry {
+			defaultExpiry = userExpiry
+		}
+	}
+
+	token, err := auth.MakeJWT(matchUser.ID, cfg.jwtSecret, defaultExpiry)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Could not generate authentication token")
+		return
+	}
+
+	// Custom inline shape matching assignment requirements
+	respondWithJSON(w, http.StatusOK, struct {
+		ID        uuid.UUID `json:"id"`
+		CreatedAt time.Time `json:"created_at"`
+		UpdatedAt time.Time `json:"updated_at"`
+		Email     string    `json:"email"`
+		Token     string    `json:"token"`
+	}{
 		ID:        matchUser.ID,
 		Email:     matchUser.Email,
-		CreatedAt: matchUser.CreatedAt.Time, // Unpacks the real time from sql.NullTime
-		UpdatedAt: matchUser.UpdatedAt.Time, // Unpacks the real time from sql.NullTime
+		CreatedAt: matchUser.CreatedAt.Time,
+		UpdatedAt: matchUser.UpdatedAt.Time,
+		Token:     token,
 	})
 }
 
@@ -329,6 +357,7 @@ func main() {
 	apiCfg := &apiConfig{}
 	apiCfg.db = dbQueries
 	apiCfg.platform = os.Getenv("PLATFORM")
+	apiCfg.jwtSecret = os.Getenv("JWT_SECRET")
 
 	// Wrap the basic fileserver with our new tracking middleware
 	fileServerHandler := http.FileServer(http.Dir("."))
