@@ -4,7 +4,8 @@ CREATE TABLE users (
   created_at TIMESTAMP,
   updated_at TIMESTAMP,
   email TEXT UNIQUE NOT NULL,
-  hashed_password TEXT NOT NULL
+  hashed_password TEXT NOT NULL,
+  is_chirpy_red BOOLEAN DEFAULT FALSE
 );
 
 CREATE TABLE chirps (
