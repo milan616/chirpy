@@ -11,7 +11,7 @@ RETURNING *;
 
 -- name: GetUserByID :one
 SELECT * FROM users
-WHERE ID = $1;
+WHERE id = $1;
 
 -- name: GetUserByEmail :one
 SELECT * FROM users
@@ -21,6 +21,11 @@ WHERE email = $1;
 UPDATE users
 SET email = $2, hashed_password = $3, updated_at = $4
 WHERE email = $1;
+
+-- name: ChirpyRedUpgrade :exec
+UPDATE users
+SET is_chirpy_red = TRUE, updated_at = $2
+WHERE id = $1;
 
 -- name: CreateRefreshToken :one
 INSERT INTO refresh_tokens (token, created_at, updated_at, user_id, expires_at, revoked_at)

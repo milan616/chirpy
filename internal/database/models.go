@@ -33,4 +33,5 @@ type User struct {
 	UpdatedAt      sql.NullTime
 	Email          string
 	HashedPassword string
+	IsChirpyRed    sql.NullBool
 }

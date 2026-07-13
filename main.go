@@ -27,6 +27,7 @@ type apiConfig struct {
 	db 				*database.Queries
 	platform		string
 	jwtSecret		string
+	polkaKey		string
 }
 
 type chirpRequest struct {
@@ -39,6 +40,7 @@ type User struct {
 	CreatedAt	time.Time `json:"created_at"`
 	UpdatedAt	time.Time `json:"updated_at"`
 	Email		string    `json:"email"`
+	IsChirpyRed	bool	  `json:"is_chirpy_red"`
 }
 
 type LoginUser struct {
@@ -186,6 +188,7 @@ func (cfg *apiConfig) handlerCreateUser(w http.ResponseWriter, r *http.Request) 
 		Email:     newUser.Email,
 		CreatedAt: newUser.CreatedAt.Time,
 		UpdatedAt: newUser.UpdatedAt.Time,
+		IsChirpyRed: newUser.IsChirpyRed.Bool,
 	})
 }
 
@@ -250,6 +253,7 @@ func (cfg *apiConfig) handlerUpdateUser(w http.ResponseWriter, r *http.Request) 
 		Email:     curUser.Email,
 		CreatedAt: curUser.CreatedAt.Time,
 		UpdatedAt: curUser.UpdatedAt.Time,
+		IsChirpyRed: curUser.IsChirpyRed.Bool,
 	})
 }
 
@@ -311,6 +315,7 @@ func (cfg *apiConfig) handlerLogin(w http.ResponseWriter, r *http.Request) {
 		Email     string    `json:"email"`
 		Token     string    `json:"token"`
 		RefreshToken	string	`json:"refresh_token"`
+		IsChirpyRed		bool	`json:"is_chirpy_red"`
 	}{
 		ID:        matchUser.ID,
 		Email:     matchUser.Email,
@@ -318,6 +323,7 @@ func (cfg *apiConfig) handlerLogin(w http.ResponseWriter, r *http.Request) {
 		UpdatedAt: matchUser.UpdatedAt.Time,
 		Token:     token,
 		RefreshToken: refreshToken,
+		IsChirpyRed: matchUser.IsChirpyRed.Bool,
 	})
 }
 
@@ -468,6 +474,54 @@ func (cfg *apiConfig) handlerDeleteChirpByID(w http.ResponseWriter, r *http.Requ
 	respondWithJSON(w, http.StatusNoContent, "Chirp deleted")
 }
 
+func (cfg *apiConfig) handlerChirpyRedUpgrade(w http.ResponseWriter, r *http.Request) {
+	apiKey, err := auth.GetAPIKey(r.Header)
+	if err != nil || cfg.polkaKey != apiKey {
+		respondWithError(w, http.StatusUnauthorized, "Invalid API Key")
+		return
+	}
+	
+	type RedUpgrade struct {
+		Event string `json:"event"`
+		Data  struct {
+			UserID string `json:"user_id"`
+		} `json:"data"`
+	}
+
+	decoder := json.NewDecoder(r.Body)
+	var redUpgrade RedUpgrade
+	err = decoder.Decode(&redUpgrade)
+	if err != nil {
+		respondWithError(w, http.StatusBadRequest, "Something went wrong")
+		return
+	} else if redUpgrade.Event != "user.upgraded" {
+		respondWithError(w, http.StatusNoContent, "")
+		return
+	}
+
+	var userID uuid.UUID
+	userID, err = uuid.Parse(redUpgrade.Data.UserID)
+	if err != nil {
+		respondWithError(w, http.StatusBadRequest, "Malformed user_id")
+		return
+	}
+
+	params := database.ChirpyRedUpgradeParams{
+		ID:			userID,
+		UpdatedAt:	sql.NullTime{Time: time.Now(), Valid: true},
+	}
+
+	ctx := context.Background()
+	err = cfg.db.ChirpyRedUpgrade(ctx, params)
+	if err != nil {
+		respondWithError(w, http.StatusNotFound, "")
+		return
+	}
+
+	respondWithJSON(w, http.StatusNoContent, "")
+	
+}
+
 func naughtyCleaner(chirp string) string {
 	naughty := []string{"kerfuffle", "sharbert", "fornax"}
 
@@ -518,6 +572,7 @@ func main() {
 	apiCfg.db = dbQueries
 	apiCfg.platform = os.Getenv("PLATFORM")
 	apiCfg.jwtSecret = os.Getenv("JWT_SECRET")
+	apiCfg.polkaKey = os.Getenv("POLKA_KEY")
 
 	// Wrap the basic fileserver with our new tracking middleware
 	fileServerHandler := http.FileServer(http.Dir("."))
@@ -541,6 +596,8 @@ func main() {
 	mux.HandleFunc("GET /api/chirps", apiCfg.handlerGetChirps)
 	mux.HandleFunc("GET /api/chirps/{chirpID}", apiCfg.handlerGetChirpByID)
 	mux.HandleFunc("DELETE /api/chirps/{chirpID}", apiCfg.handlerDeleteChirpByID)
+
+	mux.HandleFunc("POST /api/polka/webhooks", apiCfg.handlerChirpyRedUpgrade)
 
 	// Register methods attached to our apiCfg instance
 	mux.HandleFunc("GET /admin/metrics", apiCfg.handlerMetrics)
