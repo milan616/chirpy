@@ -9,8 +9,17 @@ VALUES (
 )
 RETURNING *;
 
+-- name: GetUserByID :one
+SELECT * FROM users
+WHERE ID = $1;
+
 -- name: GetUserByEmail :one
 SELECT * FROM users
+WHERE email = $1;
+
+-- name: UpdateUserInfo :exec
+UPDATE users
+SET email = $2, hashed_password = $3, updated_at = $4
 WHERE email = $1;
 
 -- name: CreateRefreshToken :one
@@ -59,4 +68,8 @@ ORDER BY created_at ASC;
 
 -- name: GetChirp :one
 SELECT * FROM chirps
+WHERE id = $1;
+
+-- name: DeleteChirp :exec
+DELETE FROM chirps
 WHERE id = $1;

@@ -189,6 +189,70 @@ func (cfg *apiConfig) handlerCreateUser(w http.ResponseWriter, r *http.Request) 
 	})
 }
 
+func (cfg *apiConfig) handlerUpdateUser(w http.ResponseWriter, r *http.Request) {
+
+	bearer, err := auth.GetBearerToken(r.Header)
+	var userID uuid.UUID
+	userID, err = auth.ValidateJWT(bearer, cfg.jwtSecret)
+	if err != nil {
+		respondWithError(w, http.StatusUnauthorized, "Unauthorized")
+		return
+	}
+	
+	decoder := json.NewDecoder(r.Body)
+	var updateUser LoginUser
+	err = decoder.Decode(&updateUser)
+	if err != nil {
+		respondWithError(w, http.StatusBadRequest, "Something went wrong")
+		return
+	}
+
+	if updateUser.Email == "" || updateUser.Password == "" {
+		respondWithError(w, http.StatusBadRequest, "Missing required email/password")
+		return
+	}
+
+	var curUser database.User
+	ctx := context.Background()
+	curUser, err = cfg.db.GetUserByID(ctx, userID)
+	if err != nil || userID != curUser.ID {
+		respondWithError(w, http.StatusUnauthorized, "Unauthorized")
+		return
+	}
+
+	var hashedPass string
+	hashedPass, err = auth.HashPassword(updateUser.Password)
+	if err != nil {
+		respondWithError(w, http.StatusBadRequest, "Unable to validate password")
+		return
+	}
+
+	updParams := database.UpdateUserInfoParams{
+		Email:			curUser.Email,
+		Email_2:		updateUser.Email,
+		HashedPassword:	hashedPass,
+		UpdatedAt:		sql.NullTime{Time: time.Now(), Valid: true},
+	}
+
+	err = cfg.db.UpdateUserInfo(ctx, updParams)
+	if err != nil {
+		respondWithError(w, http.StatusBadRequest, "Unable to update user info")
+		return
+	}
+
+	curUser, err = cfg.db.GetUserByEmail(ctx, updateUser.Email)
+	if err != nil {
+		respondWithError(w, http.StatusBadRequest, "Something went wrong")
+	}
+	
+	respondWithJSON(w, http.StatusOK, User{
+		ID:        curUser.ID,
+		Email:     curUser.Email,
+		CreatedAt: curUser.CreatedAt.Time,
+		UpdatedAt: curUser.UpdatedAt.Time,
+	})
+}
+
 func (cfg *apiConfig) handlerLogin(w http.ResponseWriter, r *http.Request) {
 	decoder := json.NewDecoder(r.Body)
 	var loginUser LoginUser
@@ -368,6 +432,42 @@ func (cfg *apiConfig) handlerGetChirpByID(w http.ResponseWriter, r *http.Request
 	})
 }
 
+func (cfg *apiConfig) handlerDeleteChirpByID(w http.ResponseWriter, r *http.Request) {
+	chirpIDString := r.PathValue("chirpID")
+
+	chirpUUID, err := uuid.Parse(chirpIDString)
+	if err != nil {
+		respondWithError(w, http.StatusBadRequest, "Invalid chirp ID format")
+		return
+	}
+
+	bearer, err := auth.GetBearerToken(r.Header)
+	var userID uuid.UUID
+	userID, err = auth.ValidateJWT(bearer, cfg.jwtSecret)
+	if err != nil {
+		respondWithError(w, http.StatusUnauthorized, "Unauthorized")
+		return
+	}
+
+	ctx := context.Background()
+	var chirp database.Chirp
+	chirp, err = cfg.db.GetChirp(ctx, chirpUUID)
+	if err != nil {
+		respondWithError(w, http.StatusBadRequest, "Could not find chirp")
+		return
+	} else if chirp.UserID != userID {
+		respondWithError(w, http.StatusForbidden, "Forbidden")
+		return
+	}
+
+	err = cfg.db.DeleteChirp(ctx, chirp.ID)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Unable to delete chirp")
+	}
+
+	respondWithJSON(w, http.StatusNoContent, "Chirp deleted")
+}
+
 func naughtyCleaner(chirp string) string {
 	naughty := []string{"kerfuffle", "sharbert", "fornax"}
 
@@ -432,6 +532,7 @@ func main() {
 	})
 
 	mux.HandleFunc("POST /api/users", apiCfg.handlerCreateUser)
+	mux.HandleFunc("PUT /api/users", apiCfg.handlerUpdateUser)
 	mux.HandleFunc("POST /api/login", apiCfg.handlerLogin)
 	mux.HandleFunc("POST /api/refresh", apiCfg.handlerRefresh)
 	mux.HandleFunc("POST /api/revoke", apiCfg.handlerRevoke)
@@ -439,6 +540,7 @@ func main() {
 	mux.HandleFunc("POST /api/chirps", apiCfg.handlerCreateChirp)
 	mux.HandleFunc("GET /api/chirps", apiCfg.handlerGetChirps)
 	mux.HandleFunc("GET /api/chirps/{chirpID}", apiCfg.handlerGetChirpByID)
+	mux.HandleFunc("DELETE /api/chirps/{chirpID}", apiCfg.handlerDeleteChirpByID)
 
 	// Register methods attached to our apiCfg instance
 	mux.HandleFunc("GET /admin/metrics", apiCfg.handlerMetrics)
