@@ -389,9 +389,21 @@ func (cfg *apiConfig) handlerRevoke(w http.ResponseWriter, r *http.Request) {
 func (cfg *apiConfig) handlerGetChirps(w http.ResponseWriter, r *http.Request) {
 	ctx := context.Background()
 
-	dbChirps, err := cfg.db.GetAllChirps(ctx)
+	s := r.URL.Query().Get("author_id")
+
+	var dbChirps []database.Chirp
+	var err error
+
+	if s != "" {
+		userID, _ := uuid.Parse(s)
+		dbChirps, err = cfg.db.GetAllChirpsByAuthor(ctx, userID)
+	} else {
+		dbChirps, err = cfg.db.GetAllChirps(ctx)
+	}
+
 	if err != nil {
 		respondWithError(w, http.StatusBadRequest, "Could not retrieve chirps")
+		return
 	}
 
 	apiChirps := make([]Chirp, len(dbChirps))
