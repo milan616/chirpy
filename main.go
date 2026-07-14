@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"strings"
 	"slices"
+	"sort"
 	"database/sql"
 	"os"
 	"time"
@@ -389,13 +390,13 @@ func (cfg *apiConfig) handlerRevoke(w http.ResponseWriter, r *http.Request) {
 func (cfg *apiConfig) handlerGetChirps(w http.ResponseWriter, r *http.Request) {
 	ctx := context.Background()
 
-	s := r.URL.Query().Get("author_id")
+	author := r.URL.Query().Get("author_id")
 
 	var dbChirps []database.Chirp
 	var err error
 
-	if s != "" {
-		userID, _ := uuid.Parse(s)
+	if author != "" {
+		userID, _ := uuid.Parse(author)
 		dbChirps, err = cfg.db.GetAllChirpsByAuthor(ctx, userID)
 	} else {
 		dbChirps, err = cfg.db.GetAllChirps(ctx)
@@ -405,6 +406,18 @@ func (cfg *apiConfig) handlerGetChirps(w http.ResponseWriter, r *http.Request) {
 		respondWithError(w, http.StatusBadRequest, "Could not retrieve chirps")
 		return
 	}
+
+	sortOrder := r.URL.Query().Get("sort")
+
+    sort.Slice(dbChirps, func(i, j int) bool {
+        if sortOrder == "desc" {
+            return dbChirps[i].CreatedAt.Time.After(dbChirps[j].CreatedAt.Time)
+        }
+        // Default fallback to ascending
+        return dbChirps[i].CreatedAt.Time.Before(dbChirps[j].CreatedAt.Time)
+    })
+
+    // apiChirps creation loop continues below...
 
 	apiChirps := make([]Chirp, len(dbChirps))
 
